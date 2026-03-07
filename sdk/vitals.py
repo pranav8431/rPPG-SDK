@@ -122,9 +122,26 @@ class RespirationEstimator:
 
 
 class BloodPressureEstimator:
-    """Blood pressure estimation from pulse wave analysis and heart rate."""
+    """Blood pressure from multi-feature PPG pulse waveform morphology.
 
-    def __init__(self, smooth_window=9):
+    Two morphological features are extracted per complete cardiac beat:
+
+    rise_ratio = foot-to-systolic-peak time / cycle length
+        Proxy for arterial stiffness. Stiffer arteries propagate the pressure
+        wave faster → shorter upstroke → lower rise_ratio → higher SBP.
+        Healthy resting adults: ~0.30–0.35.
+
+    fall_ratio = systolic-peak to next-foot time / cycle length
+        Proxy for peripheral vascular resistance. Higher resistance slows
+        diastolic run-off → longer fall phase → higher fall_ratio → higher DBP.
+        Healthy resting adults: ~0.65–0.70.
+
+    IBI (inter-beat interval) is derived directly from the waveform and used
+    in place of the passed heart_rate for the HR-deviation term when the
+    signal is clean enough to yield valid beats.
+    """
+
+    def __init__(self, smooth_window=11):
         self._sys_history = deque(maxlen=smooth_window)
         self._dia_history = deque(maxlen=smooth_window)
 
@@ -137,59 +154,100 @@ class BloodPressureEstimator:
         if pulse_signal is None or len(pulse_signal) < 64 or heart_rate is None:
             return self._smoothed_sys(), self._smoothed_dia()
 
-        min_dist = max(int(fps * 0.33), 1)
-        prominence = max(np.std(pulse_signal) * 0.3, 0.01)
-        peaks, _ = find_peaks(pulse_signal, distance=min_dist, prominence=prominence)
+        # Bandpass to cardiac band for clean morphology, then unit-normalise
+        sig = _bandpass(pulse_signal.copy(), fps, 0.7, 3.0, order=3)
+        sig -= np.mean(sig)
+        std = np.std(sig)
+        if std < 1e-10:
+            return self._smoothed_sys(), self._smoothed_dia()
+        sig /= std
 
-        if len(peaks) < 3:
+        features = self._extract_beat_features(sig, fps)
+        if not features or len(features) < 2:
             return self._smoothed_sys(), self._smoothed_dia()
 
-        # Pulse wave morphology analysis
-        troughs, _ = find_peaks(-pulse_signal, distance=min_dist)
+        rise_ratio = float(np.median([f[0] for f in features]))
+        fall_ratio = float(np.median([f[1] for f in features]))
+        ibi        = float(np.median([f[2] for f in features]))  # seconds
 
-        # Rising time (trough to peak) — shorter rise = stiffer arteries
-        rise_times = []
-        for p in peaks:
-            preceding = troughs[troughs < p]
-            if len(preceding) > 0:
-                rise_times.append((p - preceding[-1]) / fps)
+        # HR computed from IBI is more accurate than the passed value when
+        # the waveform yields enough clean beats.
+        hr_from_ibi = 60.0 / ibi if 0.33 < ibi < 2.0 else heart_rate
+        hr_dev = hr_from_ibi - 72.0   # deviation from normal resting HR
 
-        periods = np.diff(peaks) / fps
-        mean_period = float(np.mean(periods)) if len(periods) > 0 else 1.0
+        # Stiffness term: healthy rise_ratio ≈ 0.32
+        # Lower rise_ratio → faster upstroke → stiffer vessels → higher SBP
+        stiffness  = 0.32 - rise_ratio   # positive = stiffer than normal
 
-        if rise_times:
-            rise_ratio = float(np.mean(rise_times)) / mean_period if mean_period > 0 else 0.2
-        else:
-            rise_ratio = 0.2
+        # Resistance term: healthy fall_ratio ≈ 0.68
+        # Higher fall_ratio → slower run-off → higher peripheral resistance → higher DBP
+        resistance = fall_ratio - 0.68   # positive = higher resistance than normal
 
-        # Regression model incorporating HR and pulse wave stiffness
-        hr_dev = heart_rate - 72.0
-        stiffness = 0.2 - rise_ratio
-
-        sys = 118.0 + hr_dev * 0.4 + stiffness * 40.0
-        dia = 78.0 + hr_dev * 0.2 + stiffness * 20.0
+        sys = 120.0 + hr_dev * 0.55 + stiffness  * 65.0
+        dia =  80.0 + hr_dev * 0.28 + resistance * 40.0
 
         sys = float(np.clip(sys, 95, 160))
         dia = float(np.clip(dia, 55, 100))
 
-        # Ensure minimum pulse pressure
-        if sys <= dia + 20:
-            dia = sys - 20
+        # Enforce minimum physiological pulse pressure (>= 20 mmHg)
+        if sys - dia < 20:
+            centre = (sys + dia) / 2.0
+            sys = centre + 10.0
+            dia = centre - 10.0
 
         self._sys_history.append(sys)
         self._dia_history.append(dia)
-
         return self._smoothed_sys(), self._smoothed_dia()
 
-    def _smoothed_sys(self):
-        if not self._sys_history:
+    def _extract_beat_features(self, sig, fps):
+        """Extract (rise_ratio, fall_ratio, IBI) for each complete beat.
+
+        The signal must already be bandpassed and unit-normalised before
+        calling this method.
+        """
+        min_dist = max(int(fps * 0.33), 1)   # at most ~180 BPM between events
+
+        peaks,   _ = find_peaks( sig, distance=min_dist, prominence=0.30)
+        troughs, _ = find_peaks(-sig, distance=min_dist, prominence=0.20)
+
+        if len(peaks) < 3 or len(troughs) < 3:
             return None
-        return float(np.median(self._sys_history))
+
+        feats = []
+        for pk in peaks:
+            pre  = troughs[troughs < pk]
+            post = troughs[troughs > pk]
+            if len(pre) == 0 or len(post) == 0:
+                continue
+
+            t0 = int(pre[-1])   # foot before peak
+            t2 = int(post[0])   # foot after peak
+            t1 = int(pk)        # systolic peak
+
+            cycle = t2 - t0
+            # Reject cycles outside physiological HR range (30–180 BPM)
+            if not (fps * 0.33 < cycle < fps * 2.0):
+                continue
+
+            # Amplitude above interpolated baseline — rejects noise spikes
+            amp = sig[t1] - 0.5 * (sig[t0] + sig[t2])
+            if amp < 0.25:
+                continue
+
+            rise = (t1 - t0) / cycle
+            fall = (t2 - t1) / cycle
+
+            # Morphological plausibility bounds
+            if 0.10 <= rise <= 0.55 and 0.45 <= fall <= 0.90:
+                feats.append((rise, fall, cycle / fps))
+
+        return feats if len(feats) >= 2 else None
+
+    def _smoothed_sys(self):
+        return float(np.median(self._sys_history)) if self._sys_history else None
 
     def _smoothed_dia(self):
-        if not self._dia_history:
-            return None
-        return float(np.median(self._dia_history))
+        return float(np.median(self._dia_history)) if self._dia_history else None
 
     def reset(self):
         self._sys_history.clear()
