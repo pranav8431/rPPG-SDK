@@ -47,7 +47,7 @@ rppg-sdk/
 
 ```bash
 # Clone the repository
-git clone <repo-url>
+git clone https://github.com/pranav8431/rPPG-SDK
 cd rppg-sdk
 
 # Create virtual environment
