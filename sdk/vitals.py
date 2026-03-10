@@ -169,6 +169,7 @@ class BloodPressureEstimator:
         rise_ratio = float(np.median([f[0] for f in features]))
         fall_ratio = float(np.median([f[1] for f in features]))
         ibi        = float(np.median([f[2] for f in features]))  # seconds
+        pw50       = float(np.median([f[3] for f in features]))
 
         # HR computed from IBI is more accurate than the passed value when
         # the waveform yields enough clean beats.
@@ -183,8 +184,12 @@ class BloodPressureEstimator:
         # Higher fall_ratio → slower run-off → higher peripheral resistance → higher DBP
         resistance = fall_ratio - 0.68   # positive = higher resistance than normal
 
-        sys = 120.0 + hr_dev * 0.55 + stiffness  * 65.0
-        dia =  80.0 + hr_dev * 0.28 + resistance * 40.0
+        # Pulse width term: healthy pw50 ≈ 0.42
+        # Wider pulse at half-height → lower vascular resistance → lower BP
+        width_dev = pw50 - 0.42
+
+        sys = 120.0 + hr_dev * 0.50 + stiffness * 60.0 - width_dev * 15.0
+        dia =  80.0 + hr_dev * 0.25 + resistance * 35.0 - width_dev * 25.0
 
         sys = float(np.clip(sys, 95, 160))
         dia = float(np.clip(dia, 55, 100))
@@ -237,9 +242,15 @@ class BloodPressureEstimator:
             rise = (t1 - t0) / cycle
             fall = (t2 - t1) / cycle
 
+            # PW50: pulse width at 50% of beat amplitude
+            baseline = 0.5 * (sig[t0] + sig[t2])
+            half_height = baseline + 0.5 * (sig[t1] - baseline)
+            above_half = sig[t0:t2 + 1] > half_height
+            pw50 = float(np.sum(above_half)) / cycle
+
             # Morphological plausibility bounds
             if 0.10 <= rise <= 0.55 and 0.45 <= fall <= 0.90:
-                feats.append((rise, fall, cycle / fps))
+                feats.append((rise, fall, cycle / fps, pw50))
 
         return feats if len(feats) >= 2 else None
 

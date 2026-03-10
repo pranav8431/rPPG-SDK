@@ -6,8 +6,8 @@ A real-time, non-contact vital signs monitoring SDK that extracts physiological 
 
 ## Features
 
-- **Heart Rate (BPM)** — Dual spectral + time-domain estimation with parabolic interpolation for sub-BPM accuracy
-- **Blood Pressure (mmHg)** — Systolic/diastolic estimation via pulse wave morphology analysis
+- **Heart Rate (BPM)** — Triple-method estimation (spectral + temporal + autocorrelation) with harmonic rejection and majority-vote fusion for sub-BPM accuracy
+- **Blood Pressure (mmHg)** — Systolic/diastolic estimation via multi-feature pulse wave morphology analysis (rise ratio, fall ratio, PW50)
 - **Blood Oxygen Saturation (SpO2 %)** — Ratio-of-ratios technique on RGB channel pulsatile components
 - **Respiration Rate (breaths/min)** — Hilbert transform envelope extraction with spectral peak analysis
 - **Face Detection & Tracking** — MediaPipe FaceLandmarker with 468 landmarks for precise ROI extraction
@@ -60,6 +60,16 @@ This opens a window with:
 - Bottom dashboard showing **Heart Rate**, **Blood Pressure**, **SpO2**, and **Respiration Rate**
 
 Press **q** to quit.
+
+### One-Shot BP & Heart Rate
+
+For a single, high-accuracy measurement of heart rate and blood pressure:
+
+```bash
+python examples/bp_hr_demo.py
+```
+
+This accumulates ~10 seconds of data with a progress bar, then displays a final reading and stops. No continuous monitoring — just one precise measurement.
 
 ---
 
@@ -238,7 +248,8 @@ rPPG-SDK/
 │   ├── vitals.py             # SpO2, BP, respiration estimators
 │   └── rppg_sdk.py           # Main SDK orchestrator
 ├── examples/
-│   └── webcam_demo.py        # Real-time webcam demo with dashboard UI
+│   ├── webcam_demo.py        # Real-time webcam demo with dashboard UI
+│   └── bp_hr_demo.py         # One-shot BP & heart rate measurement
 ├── models/
 │   └── face_landmarker.task  # MediaPipe face model (auto-downloaded on first run)
 ├── requirements.txt
@@ -265,10 +276,11 @@ Based on Wang et al., *"Algorithmic Principles of Remote PPG"* (IEEE TBME, 2017)
 
 ### Heart Rate
 
-- **Spectral**: Welch's PSD with 2048-point FFT and parabolic interpolation for sub-bin precision
-- **Temporal**: Peak detection with adaptive prominence; median IBI → BPM
-- **Fusion**: Weighted average when both agree within 15 BPM; history-closest used when they disagree
-- **Smoothing**: Median filter over 5 recent estimates, ±20 BPM outlier gate
+- **Spectral**: Welch's PSD with 2048-point FFT, parabolic interpolation for sub-bin precision, and harmonic rejection (checks sub-harmonic at half the peak frequency)
+- **Temporal**: Peak detection with adaptive prominence; IQR-filtered inter-beat intervals; median IBI → BPM
+- **Autocorrelation**: ACF-based fundamental period detection, inherently immune to harmonic doubling
+- **Fusion**: Three-way majority vote — closest agreeing pair is averaged (within 12 BPM); otherwise median of three used
+- **Smoothing**: Median filter over recent estimates, ±20 BPM outlier gate
 
 ### SpO2
 
@@ -276,7 +288,7 @@ Ratio-of-ratios using AC/DC components of red and green channels as a proxy for 
 
 ### Blood Pressure
 
-Pulse wave rising-time analysis combined with heart-rate regression modeling to estimate systolic and diastolic pressures.
+Multi-feature pulse wave morphology analysis: rising-time ratio (arterial stiffness), falling-time ratio (peripheral resistance), and PW50 (pulse width at 50% amplitude, vascular compliance) combined with heart-rate regression to estimate systolic and diastolic pressures.
 
 ### Respiration Rate
 
